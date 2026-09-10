@@ -1,0 +1,1 @@
+Exploring option pricing, numerical accuracy, and model limitations in C++.
