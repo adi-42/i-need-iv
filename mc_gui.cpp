@@ -1,5 +1,7 @@
+#include "bsm.hpp"
+#include "gui_common.hpp"
+
 #include <algorithm>
-#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <iomanip>
@@ -8,26 +10,6 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-
-double readDouble(const char* text, double minimum, double maximum) {
-    std::size_t end = 0;
-    const std::string input(text);
-    const double value = std::stod(input, &end);
-    if (end != input.size() || !std::isfinite(value) || value < minimum || value > maximum) {
-        throw std::invalid_argument("Numeric input is invalid or outside the GUI's supported range.");
-    }
-    return value;
-}
-
-unsigned int readInteger(const char* text) {
-    const std::string input(text);
-    unsigned int value = 0;
-    const auto result = std::from_chars(input.data(), input.data() + input.size(), value);
-    if (result.ec != std::errc{} || result.ptr != input.data() + input.size()) {
-        throw std::invalid_argument("Simulation count and seed must be unsigned integers.");
-    }
-    return value;
-}
 
 struct Statistics {
     unsigned int count = 0;
@@ -45,34 +27,6 @@ struct Statistics {
         return std::sqrt(m2 / (count - 1) / count);
     }
 };
-
-double blackScholes(double spot, double strike, double maturity, double rate, double sigma, bool call) {
-    const double discountedStrike = strike * std::exp(-rate * maturity);
-    if (maturity == 0.0 || sigma == 0.0) {
-        return std::max(call ? spot - discountedStrike : discountedStrike - spot, 0.0);
-    }
-    if (strike == 0.0) {
-        return call ? spot : 0.0;
-    }
-    const double scale = sigma * std::sqrt(maturity);
-    const double d1 = (std::log(spot / strike) + (rate + 0.5 * sigma * sigma) * maturity) / scale;
-    const double d2 = d1 - scale;
-    const auto cdf = [](double x) { return 0.5 * std::erfc(-x / std::sqrt(2.0)); };
-    return call ? spot * cdf(d1) - discountedStrike * cdf(d2) :
-        discountedStrike * cdf(-d2) - spot * cdf(-d1);
-}
-
-template <typename Value>
-void writeArray(const std::vector<Value>& values) {
-    std::cout << '[';
-    for (std::size_t i = 0; i < values.size(); ++i) {
-        if (i != 0) {
-            std::cout << ',';
-        }
-        std::cout << values[i];
-    }
-    std::cout << ']';
-}
 
 void writeHistogram(const std::vector<double>& values) {
     const auto [low, high] = std::minmax_element(values.begin(), values.end());
@@ -112,7 +66,7 @@ int main(int argc, char* argv[]) {
             throw std::invalid_argument("Use 2 to 1000000 simulations and option type call or put.");
         }
         const bool call = option == "call";
-        const double benchmark = blackScholes(spot, strike, maturity, rate, sigma, call);
+        const double benchmark = blackScholesOptionPricing(spot, strike, rate, sigma, maturity, call).premium;
         const double drift = (rate - 0.5 * sigma * sigma) * maturity;
         const double diffusion = sigma * std::sqrt(maturity);
         const double discount = std::exp(-rate * maturity);

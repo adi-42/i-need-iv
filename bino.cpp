@@ -1,7 +1,10 @@
-#include <iostream>
-#include <vector>
-#include <cmath>
+#include "bino.hpp"
+
 #include <algorithm>
+#include <cmath>
+#include <iostream>
+#include <stdexcept>
+#include <vector>
 
 //improvements TODO:
 // use pointers to return stuff
@@ -9,85 +12,110 @@
 // print the entire tree
 // optimized calculateParameters() func for r, sigma
 
-class BinomialOptionPricing {
-public:
-    BinomialOptionPricing(double S, double K, double r, double T, double sigma, int N, bool isCall, bool isAmerican, double q = 0.0)
-        : S(S), K(K), r(r), T(T), sigma(sigma), N(N), isCall(isCall), isAmerican(isAmerican), q(q) {
-        calculateParameters();
+BinomialOptionPricing::BinomialOptionPricing(double S, double K, double r, double T, double sigma,
+                                           int N, bool isCall, bool isAmerican, double q)
+    : S(S), K(K), r(r), T(T), sigma(sigma), q(q), N(N), isCall(isCall), isAmerican(isAmerican) {
+    if (!std::isfinite(S) || !std::isfinite(K) || !std::isfinite(r) ||
+        !std::isfinite(T) || !std::isfinite(sigma) || !std::isfinite(q) ||
+        S <= 0.0 || K < 0.0 || T < 0.0 || sigma < 0.0 || N < 1) {
+        throw std::invalid_argument("Binomial inputs must be finite, with positive spot/steps and nonnegative strike, maturity and volatility.");
+    }
+    calculateParameters();
+}
+
+void BinomialOptionPricing::calculateParameters() {
+    dt = T / N;
+    jump = sigma * std::sqrt(dt);
+    u = std::exp((r - q) * dt + jump);
+    d = std::exp((r - q) * dt - jump);
+    discountFactor = std::exp(-r * dt);
+    if (!std::isfinite(u) || !std::isfinite(d) || !std::isfinite(discountFactor) ||
+        d == 0.0 || discountFactor == 0.0) {
+        throw std::overflow_error("Binomial parameters exceed the supported numerical range.");
+    }
+    if (T == 0.0 || sigma == 0.0) {
+        // price() handles these non-branching cases directly.
+        p = 0.5;
+    } else {
+        if (u == d) {
+            throw std::overflow_error("Binomial up/down factors are indistinguishable at double precision.");
+        }
+        p = (std::exp((r - q) * dt) - d) / (u - d);
+        if (!std::isfinite(p) || p < 0.0 || p > 1.0) {
+            throw std::overflow_error("Binomial probability is outside the supported numerical range.");
+        }
+    }
+}
+
+double BinomialOptionPricing::stockAt(int step, int downMoves) const {
+    if (step == 0) {
+        return S;
+    }
+    const double stock = std::exp(std::log(S) + (r - q) * dt * step + jump * (step - 2.0 * downMoves));
+    if (!std::isfinite(stock)) {
+        throw std::overflow_error("Binomial node exceeds the supported numerical range.");
+    }
+    return stock;
+}
+
+double BinomialOptionPricing::optionPayoff(double stock) const {
+    return std::max(isCall ? stock - K : K - stock, 0.0);
+}
+
+double BinomialOptionPricing::price() const {
+    if (T == 0.0) {
+        return optionPayoff(S);
+    }
+    if (sigma == 0.0) {
+        double best = 0.0;
+        const int first = isAmerican ? 0 : N;
+        for (int step = first; step <= N; ++step) {
+            const double value = std::exp(-r * dt * step) * optionPayoff(stockAt(step, 0));
+            if (!std::isfinite(value)) {
+                throw std::overflow_error("Deterministic option price exceeds the supported numerical range.");
+            }
+            best = std::max(best, value);
+        }
+        return best;
     }
 
-    double price() {
-        std::vector<double> optionValues(N + 1);
-
-        // Calculate option values at maturity (node values of the tree)
-        for (int i = 0; i <= N; ++i) {
-            double ST = S * std::pow(u, N - i) * std::pow(d, i); //price at time T
-            optionValues[i] = optionPayoff(ST);
-        }
-
-        // Backward induction to get the option price at t=0
-        for (int step = N - 1; step >= 0; --step) {
-            for (int i = 0; i <= step; ++i) {
-                optionValues[i] = (p * optionValues[i] + (1 - p) * optionValues[i + 1]) * discountFactor;
-                
-                // For American options, check for early exercise
-                if (isAmerican) {
-                    double ST = S * std::pow(u, step - i) * std::pow(d, i);
-                    optionValues[i] = std::max(optionValues[i], optionPayoff(ST));
-                }
+    std::vector<double> optionValues(static_cast<std::size_t>(N) + 1);
+    for (int i = 0; i <= N; ++i) {
+        optionValues[i] = optionPayoff(stockAt(N, i));
+    }
+    for (int step = N - 1; step >= 0; --step) {
+        for (int i = 0; i <= step; ++i) {
+            optionValues[i] = (p * optionValues[i] + (1.0 - p) * optionValues[i + 1]) * discountFactor;
+            if (isAmerican) {
+                optionValues[i] = std::max(optionValues[i], optionPayoff(stockAt(step, i)));
             }
         }
-
-        return optionValues[0];
     }
-
-private:
-    double S, K, r, T, sigma, q;
-    int N;
-    bool isCall;
-    bool isAmerican;
-    double u, d, p, discountFactor;
-
-    void calculateParameters() {
-        double dt = T / N;
-        u = std::exp((r - q) * dt + sigma * std::sqrt(dt));
-        d = std::exp((r - q) * dt - sigma * std::sqrt(dt));
-        p = (std::exp((r - q) * dt) - d) / (u - d);
-        discountFactor = std::exp(-r * dt);
+    if (!std::isfinite(optionValues[0])) {
+        throw std::overflow_error("Binomial price exceeds the supported numerical range.");
     }
-
-    double optionPayoff(double ST) const {
-        if (isCall) {
-            return std::max(0.0, ST - K);
-        } else {
-            return std::max(0.0, K - ST);
-        }
-    }
-};
-
-int main() {
-    double S = 100.0;    // Current stock price
-    double K = 100.0;     // Option strike price
-    double r = 0.05;     // Risk-free rate
-    double T = 1.0;      // Time to maturity (in years)
-    double sigma = 0.2;  // Volatility
-    int N = 100;         // Number of time steps
-    bool isCall = false; // False for Put option
-    bool isAmerican = true; // True for American, False for European
-    double q = 0.03;     // Dividend yield
-
-    BinomialOptionPricing americanOption(S, K, r, T, sigma, N, isCall, isAmerican, q);
-    double americanOptionPrice = americanOption.price();
-    
-    std::cout << "The American " << (isCall ? "call" : "put") << " option price is: " << americanOptionPrice << std::endl;
-
-
-    isAmerican = false; // True for American, False for European
-
-    BinomialOptionPricing europeanOption(S, K, r, T, sigma, N, isCall, isAmerican, q);
-    double europeanOptionPrice = europeanOption.price();
-
-    std::cout << "The European " << (isCall ? "call" : "put") << " option price is: " << europeanOptionPrice << std::endl;
-
-    return 0;
+    return optionValues[0];
 }
+
+BinomialParameters BinomialOptionPricing::parameters() const {
+    return {dt, u, d, p};
+}
+
+#ifndef PRICERS_NO_MAIN
+int main() {
+    const double S = 100.0;
+    const double K = 100.0;
+    const double r = 0.05;
+    const double T = 1.0;
+    const double sigma = 0.2;
+    const int N = 100;
+    const bool isCall = false;
+    const double q = 0.03;
+
+    for (const bool american : {true, false}) {
+        const BinomialOptionPricing option(S, K, r, T, sigma, N, isCall, american, q);
+        std::cout << "The " << (american ? "American " : "European ") << (isCall ? "call" : "put")
+                  << " option price is: " << option.price() << '\n';
+    }
+}
+#endif

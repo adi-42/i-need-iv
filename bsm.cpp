@@ -1,119 +1,80 @@
-#include <iostream>
+#include "bsm.hpp"
+
+#include <algorithm>
 #include <cmath>
+#include <iostream>
+#include <limits>
+#include <numbers>
+#include <stdexcept>
 
-struct Contract
-{
-    double premium;
-    int dte;
-    double delta;
-    double gamma;
-    double theta;
-    double vega;
-    double rho;
-    double implied_volatility;
-    double intrinsic_value;
-};
-
-
-// Error function approximation
-double erf(double x) {
-    const double A1 = 0.254829592;
-    const double A2 = -0.284496736;
-    const double A3 = 1.421413741;
-    const double A4 = -1.453152027;
-    const double A5 = 1.061405429;
-    const double P = 0.3275911;
-
-    // Save the sign of x
-    int sign = (x >= 0) ? 1 : -1;
-    x = fabs(x);
-
-    // A&S formula 7.1.26
-    double t = 1.0 / (1.0 + P * x);
-    double y = 1.0 - (((((A5 * t + A4) * t) + A3) * t + A2) * t + A1) * t * exp(-x * x);
-
-    return sign * y;
-}
-
-// Cumulative standard normal density function
+namespace {
 double cumulativeStandardNormal(double x) {
-    return 0.5 * (1.0 + erf(x / sqrt(2.0)));
+    return 0.5 * std::erfc(-x / std::sqrt(2.0));
+}
 }
 
-
-// Black Scholes Model for option pricing
 Contract blackScholesOptionPricing(double S0, double K, double r, double sigma, double T, bool isCallOption) {
+    if (!std::isfinite(S0) || !std::isfinite(K) || !std::isfinite(r) ||
+        !std::isfinite(sigma) || !std::isfinite(T) || S0 <= 0.0 || K < 0.0 ||
+        sigma < 0.0 || T < 0.0) {
+        throw std::invalid_argument("BSM requires finite inputs, positive spot and nonnegative strike, volatility and maturity.");
+    }
+    const double discountedStrike = K * std::exp(-r * T);
+    if (!std::isfinite(discountedStrike) || T * 365.2425 > std::numeric_limits<int>::max()) {
+        throw std::overflow_error("BSM inputs exceed the supported numerical range.");
+    }
+
     Contract con;
-    int days_till_expiry = T * 365.2425;
-    con.dte = days_till_expiry;
-
-    if (isCallOption)
-    {
-        double d1 = (log(S0/K) + (r + ((sigma * sigma) / 2)) * T) / (sigma * std::sqrt(T));
-
-        double d2 = d1 - (sigma * std::sqrt(T));
-
-        con.premium = S0 * cumulativeStandardNormal(d1) - K * std::exp(-r * T) * cumulativeStandardNormal(d2);
-
-        con.delta = cumulativeStandardNormal(d1);
-
-        con.gamma = cumulativeStandardNormal(d1) / (S0 * sigma * std::sqrt(T));
-
-        con.theta = (-(S0 * cumulativeStandardNormal(d1) * sigma) / (2 * std::sqrt(T))) - (r * K * std::exp(-r * T) * cumulativeStandardNormal(d2));
-
-        con.vega = S0 * cumulativeStandardNormal(d1) * std::sqrt(T);
-
-        con.rho = K * T * std::exp(-r * T) * cumulativeStandardNormal(d2);
-
-        con.implied_volatility = sigma - ((con.premium - (con.premium - 0.01))/(con.vega));
-
-        con.intrinsic_value = std::max(S0 -K, 0.0);
-
+    con.dte = static_cast<int>(T * 365.2425);
+    con.volatility = sigma;
+    con.intrinsic_value = std::max(isCallOption ? S0 - K : K - S0, 0.0);
+    if (T == 0.0 || sigma == 0.0 || K == 0.0) {
+        con.premium = std::max(isCallOption ? S0 - discountedStrike : discountedStrike - S0, 0.0);
+        return con;
     }
 
-    else
-    {
-        double d1 = (log(S0/K) + (r + ((sigma * sigma) / 2)) * T) / (sigma * std::sqrt(T));
-
-        double d2 = d1 - (sigma * std::sqrt(T));
-
-        con.premium = K * std::exp(-r * T) * cumulativeStandardNormal(-d2) - S0 * cumulativeStandardNormal(-d1);
-
-        con.delta = cumulativeStandardNormal(d1) - 1;
-
-        con.gamma = cumulativeStandardNormal(d1) / (S0 * sigma * std::sqrt(T));
-
-        con.theta = (-(S0 * cumulativeStandardNormal(d1) * sigma) / (2 * std::sqrt(T))) + (r * K * std::exp(-r * T) * cumulativeStandardNormal(-d2));
-
-        con.vega = S0 * cumulativeStandardNormal(d1) * std::sqrt(T);
-
-        con.rho = -K * T * std::exp(-r * T) * cumulativeStandardNormal(-d2);
-
-        con.implied_volatility = sigma - (((con.premium - 0.01) - con.premium)/(con.vega));
-
-        con.intrinsic_value = std::max(K - S0, 0.0);
+    const double rootT = std::sqrt(T);
+    const double scale = sigma * rootT;
+    const double d1 = (std::log(S0) - std::log(K) + (r + 0.5 * sigma * sigma) * T) / scale;
+    const double d2 = d1 - scale;
+    const double density = std::exp(-0.5 * d1 * d1) / std::sqrt(2.0 * std::numbers::pi);
+    const double sign = isCallOption ? 1.0 : -1.0;
+    con.premium = sign * (S0 * cumulativeStandardNormal(sign * d1) -
+                          discountedStrike * cumulativeStandardNormal(sign * d2));
+    con.delta = sign * cumulativeStandardNormal(sign * d1);
+    con.gamma = density / (S0 * scale);
+    con.theta = -S0 * density * sigma / (2.0 * rootT) -
+                sign * r * discountedStrike * cumulativeStandardNormal(sign * d2);
+    con.vega = S0 * density * rootT;
+    con.rho = sign * discountedStrike * T * cumulativeStandardNormal(sign * d2);
+    for (const double value : {con.premium, con.delta, con.gamma, con.theta, con.vega, con.rho}) {
+        if (!std::isfinite(value)) {
+            throw std::overflow_error("BSM price or Greeks exceeded the supported numerical range.");
+        }
     }
-
+    con.greeksAvailable = true;
     return con;
-
 }
 
+#ifndef PRICERS_NO_MAIN
 int main() {
-    // Option parameters
-    double S0 = 100.0;   // Initial stock price
-    double K = 100.0;    // Strike price
-    double r = 0.05;     // Risk-free rate
-    double sigma = 0.2;  // Volatility
-    double T = 1;      // Time to maturity (in years)
-    
+    const double S0 = 100.0;
+    const double K = 100.0;
+    const double r = 0.05;
+    const double sigma = 0.2;
+    const double T = 1.0;
 
-    // Calculate option prices
-    auto callContract = blackScholesOptionPricing(S0, K, r, sigma, T, true);
-    auto putContract = blackScholesOptionPricing(S0, K, r, sigma, T, false);
-
-    // Output the results
-    std::cout << "European Call Option Price: " << callContract.premium << ", dte: " << callContract.dte << ", delta: " << callContract.delta << ", gamma: " << callContract.gamma << ", theta: " << callContract.theta << ", vega: " << callContract.vega  << ", rho: " << callContract.rho << ", implied volatility: " << callContract.implied_volatility  << ", intrinsic value: " << callContract.intrinsic_value << std::endl;
-    std::cout << "European Put Option Price: " << putContract.premium << ", dte: " << putContract.dte << ", delta: " << putContract.delta << ", gamma: " << putContract.gamma << ", theta: " << putContract.theta << ", vega: " << putContract.vega << ", rho: " << putContract.rho << ", implied volatility: " << putContract.implied_volatility  << ", intrinsic value: " << putContract.intrinsic_value << std::endl;
-
-    return 0;
+    for (const bool call : {true, false}) {
+        const auto con = blackScholesOptionPricing(S0, K, r, sigma, T, call);
+        std::cout << "European " << (call ? "Call" : "Put") << " Option Price: " << con.premium
+                  << ", dte: " << con.dte;
+        if (con.greeksAvailable) {
+            std::cout << ", delta: " << con.delta << ", gamma: " << con.gamma
+                      << ", theta: " << con.theta << ", vega: " << con.vega << ", rho: " << con.rho;
+        } else {
+            std::cout << ", Greeks omitted for boundary inputs";
+        }
+        std::cout << ", input volatility: " << con.volatility << ", intrinsic value: " << con.intrinsic_value << '\n';
+    }
 }
+#endif
