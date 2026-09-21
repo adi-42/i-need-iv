@@ -5,17 +5,49 @@
 #include <algorithm>
 #include <iomanip>
 #include <set>
+#include <utility>
+
+namespace {
+struct GreekCurve {
+    std::string axis = "spot";
+    std::vector<double> values;
+    std::vector<Contract> contracts;
+};
+
+void writeGreekCurve(const GreekCurve& curve) {
+    std::cout << "{\"axis\":\"" << curve.axis << "\",\"values\":";
+    writeArray(curve.values);
+    for (const auto& [name, member] : {
+             std::pair{"delta", &Contract::delta}, {"gamma", &Contract::gamma},
+             {"theta", &Contract::theta}, {"vega", &Contract::vega}, {"rho", &Contract::rho}}) {
+        std::cout << ",\"" << name << "\":[";
+        for (std::size_t i = 0; i < curve.contracts.size(); ++i) {
+            if (i != 0) {
+                std::cout << ',';
+            }
+            if (curve.contracts[i].greeksAvailable) {
+                std::cout << curve.contracts[i].*member;
+            } else {
+                std::cout << "null";
+            }
+        }
+        std::cout << ']';
+    }
+    std::cout << '}';
+}
+}
 
 int main(int argc, char* argv[]) {
     try {
-        if (argc != 8 && argc != 10) {
+        if (argc != 8 && argc != 10 && argc != 11) {
             throw std::invalid_argument(
-                "Usage: pricing_gui.exe bsm|binomial spot strike years rate volatility call|put [steps european|american]");
+                "Usage: pricing_gui.exe bsm|binomial spot strike years rate volatility call|put "
+                "[BSM: axis minimum maximum | binomial: steps european|american]");
         }
         const std::string method(argv[1]);
         if ((method != "bsm" && method != "binomial") ||
-            (method == "bsm" && argc != 8) || (method == "binomial" && argc != 10)) {
-            throw std::invalid_argument("BSM takes no tree arguments; binomial requires steps and exercise style.");
+            (method == "bsm" && argc != 8 && argc != 11) || (method == "binomial" && argc != 10)) {
+            throw std::invalid_argument("BSM optionally takes axis/minimum/maximum; binomial requires steps and exercise style.");
         }
         const double spot = readDouble(argv[2], 0.01, 1e9);
         const double strike = readDouble(argv[3], 0.0, 1e9);
@@ -33,8 +65,54 @@ int main(int argc, char* argv[]) {
         std::vector<double> spots, spotPrices, vols, volPrices, europeanPrices, americanPrices;
         std::vector<int> checkpoints;
         BinomialParameters parameters{};
+        GreekCurve greekCurve;
 
         if (method == "bsm") {
+            if (argc == 11) {
+                greekCurve.axis = argv[8];
+            }
+            double selected = 0.0, minimum = 0.0, maximum = 0.0;
+            if (greekCurve.axis == "spot") {
+                selected = spot;
+                minimum = 0.01;
+                maximum = 1e9;
+            } else if (greekCurve.axis == "strike") {
+                selected = strike;
+                maximum = 1e9;
+            } else if (greekCurve.axis == "maturity") {
+                selected = maturity;
+                maximum = 30.0;
+            } else if (greekCurve.axis == "rate") {
+                selected = rate;
+                minimum = -0.5;
+                maximum = 0.5;
+            } else if (greekCurve.axis == "volatility") {
+                selected = sigma;
+                maximum = 3.0;
+            } else {
+                throw std::invalid_argument("Greek axis must be spot, strike, maturity, rate or volatility.");
+            }
+            const double low = argc == 11 ? readDouble(argv[9], minimum, maximum) : std::max(0.01, spot * 0.5);
+            const double high = argc == 11 ? readDouble(argv[10], minimum, maximum) : std::min(1e9, spot * 1.5);
+            if (low >= high || selected < low || selected > high) {
+                throw std::invalid_argument("Greek sweep must have increasing bounds containing the selected input.");
+            }
+            std::set<double> grid{low, high, selected};
+            if (greekCurve.axis == "spot" && strike >= low && strike <= high) {
+                grid.insert(strike);
+            }
+            for (int i = 1; i < 120; ++i) {
+                grid.insert(low + (high - low) * i / 120.0);
+            }
+            for (const double value : grid) {
+                greekCurve.values.push_back(value);
+                greekCurve.contracts.push_back(blackScholesOptionPricing(
+                    greekCurve.axis == "spot" ? value : spot,
+                    greekCurve.axis == "strike" ? value : strike,
+                    greekCurve.axis == "rate" ? value : rate,
+                    greekCurve.axis == "volatility" ? value : sigma,
+                    greekCurve.axis == "maturity" ? value : maturity, call));
+            }
             for (int i = 0; i <= 60; ++i) {
                 const double value = spot * (0.5 + i / 60.0);
                 spots.push_back(value);
@@ -100,7 +178,8 @@ int main(int argc, char* argv[]) {
             writeArray(vols);
             std::cout << ",\"price\":";
             writeArray(volPrices);
-            std::cout << '}';
+            std::cout << "},\"greek_curve\":";
+            writeGreekCurve(greekCurve);
         } else {
             const double european = europeanPrices.back();
             const double american = americanPrices.back();

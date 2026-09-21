@@ -10,7 +10,8 @@ $python = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
 $build = Join-Path $PSScriptRoot '.gui-build'
 $targets = @(
     @{ Name = 'mc_gui'; Sources = @('mc_gui.cpp', 'bsm.cpp'); Headers = @('bsm.hpp', 'gui_common.hpp') },
-    @{ Name = 'pricing_gui'; Sources = @('pricing_gui.cpp', 'bsm.cpp', 'bino.cpp'); Headers = @('bsm.hpp', 'bino.hpp', 'gui_common.hpp') }
+    @{ Name = 'pricing_gui'; Sources = @('pricing_gui.cpp', 'bsm.cpp', 'bino.cpp'); Headers = @('bsm.hpp', 'bino.hpp', 'gui_common.hpp') },
+    @{ Name = 'ppn_gui'; Sources = @('ppn_gui.cpp'); Headers = @('gui_common.hpp') }
 )
 
 foreach ($target in $targets) {

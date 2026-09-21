@@ -5,10 +5,61 @@ import subprocess
 import plotly.graph_objects as go
 import streamlit as st
 
+from portfolio_gui import render_portfolio
+
 
 ROOT = Path(__file__).resolve().parent
 MC_ENGINE = ROOT / ".gui-build" / "mc_gui.exe"
 PRICING_ENGINE = ROOT / ".gui-build" / "pricing_gui.exe"
+BSM_AXES = {
+    "spot": ("Spot", 1),
+    "strike": ("Strike", 1),
+    "maturity": ("Time to expiry (years)", 1),
+    "rate": ("Interest rate (%)", 100),
+    "volatility": ("Volatility (%)", 100),
+}
+GREEKS = [
+    ("delta", "Delta", 1), ("gamma", "Gamma", 1), ("theta", "Theta / day", 365),
+    ("vega", "Vega / 1 percentage point", 100), ("rho", "Rho / 1 percentage point", 100),
+]
+
+
+def bsm_slider_ranges(inputs):
+    anchor = inputs["strike"] or inputs["spot"]
+    return {
+        "spot": (max(0.01, 0.5 * min(inputs["spot"], anchor)), min(1e9, 1.5 * max(inputs["spot"], anchor))),
+        "strike": (0.0, min(1e9, max(1.0, 2 * max(inputs["spot"], inputs["strike"])))),
+        "maturity": (0.0, min(30.0, max(2.0, 2 * inputs["maturity"]))),
+        "rate": (min(-0.1, inputs["rate"]), max(0.2, inputs["rate"])),
+        "volatility": (0.0, min(3.0, max(0.6, 1.5 * inputs["volatility"]))),
+    }
+
+
+def run_engine(engine, args):
+    try:
+        process = subprocess.run(
+            [str(engine), *map(str, args)], capture_output=True, text=True, check=True, timeout=30
+        )
+        result = json.loads(process.stdout)
+    except FileNotFoundError as error:
+        raise RuntimeError("C++ engine not found. Start this app with .\\run_gui.ps1 to build it.") from error
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(error.stderr.strip() or f"C++ engine exited with code {error.returncode}.") from error
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("C++ calculation exceeded 30 seconds. Reduce simulations or tree steps.") from error
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"C++ engine returned invalid JSON: {error}") from error
+    if engine == PRICING_ENGINE and args[0] == "bsm":
+        required = {"inputs", "price", "intrinsic_value", "lower_bound", "greeks", "spot_curve", "volatility_curve", "greek_curve"}
+        curve = result.get("greek_curve") if isinstance(result, dict) else None
+        if (
+            not isinstance(result, dict) or not required.issubset(result) or not isinstance(curve, dict)
+            or curve.get("axis") not in BSM_AXES or not isinstance(curve.get("values"), list)
+            or not curve["values"]
+            or any(not isinstance(curve.get(name), list) or len(curve[name]) != len(curve["values"]) for name, _, _ in GREEKS)
+        ):
+            raise RuntimeError("C++ BSM engine returned an unexpected schema. Rebuild with .\\run_gui.ps1 -BuildOnly.")
+    return result
 
 
 def render_mc(result):
@@ -81,7 +132,7 @@ def render_mc(result):
     )
 
 
-def render_bsm(result):
+def render_bsm_result(result):
     inputs = result["inputs"]
     st.caption("Black-Scholes-Merton | European exercise | Deterministic: seed and simulation count do not apply")
     columns = st.columns(3)
@@ -108,6 +159,36 @@ def render_bsm(result):
                 "Price change for volatility 20% -> 21%", "Price change for rate 5% -> 6%",
             ],
         })
+    curve = result["greek_curve"]
+    axis = curve["axis"]
+    axis_label, axis_scale = BSM_AXES[axis]
+    st.caption(
+        f"Each Greek vs {axis_label.lower()}; all other inputs are held fixed. The dot marks the selected option. "
+        "Changing the x-axis input moves the dot; changing another input reshapes the curves."
+    )
+    columns = st.columns(2)
+    for index, (name, label, scale) in enumerate(GREEKS):
+        figure = go.Figure(go.Scatter(
+            x=[value * axis_scale for value in curve["values"]],
+            y=[None if value is None else value / scale for value in curve[name]],
+            mode="lines", name=label, connectgaps=False,
+        ))
+        if greeks is not None:
+            figure.add_scatter(
+                x=[inputs[axis] * axis_scale], y=[greeks[name] / scale],
+                mode="markers", name="Selected inputs", marker_size=10,
+            )
+        figure.add_hline(y=0, line_dash="dot", line_color="gray")
+        figure.update_layout(
+            title=label, xaxis_title=axis_label, yaxis_title=label, height=310,
+        )
+        with columns[index % 2]:
+            st.plotly_chart(figure, width="stretch", key=f"bsm_greek_{name}")
+    st.caption(
+        "Gaps denote Greeks omitted at zero time, volatility or strike, not zero sensitivities. "
+        "Theta measures time passing, so it is the negative derivative with respect to time remaining. "
+        "Curves are sampled; very sharp near-expiry peaks may be under-resolved."
+    )
     for column, key, x_key, title, x_label, scale in zip(
         st.columns(2),
         ["spot_curve", "volatility_curve"],
@@ -132,6 +213,74 @@ def render_bsm(result):
         "gamma describes its curvature; vega describes sensitivity to volatility. Greeks are local "
         "approximations, not exact changes for large moves. These are model sensitivities, not an implied-volatility smile "
         "or a comparison with market prices."
+    )
+
+
+@st.fragment
+def render_bsm(initial_result):
+    baseline = initial_result["inputs"]
+    ranges = bsm_slider_ranges(baseline)
+    if "bsm_baseline" not in st.session_state:
+        st.session_state.bsm_baseline = dict(baseline)
+        for name, (_, scale) in BSM_AXES.items():
+            st.session_state[f"bsm_{name}"] = float(baseline[name] * scale)
+        st.session_state.bsm_option = baseline["option"].title()
+        st.session_state.bsm_axis = "spot"
+        for key in ("bsm_explorer_result", "bsm_explorer_request", "bsm_explorer_error"):
+            st.session_state.pop(key, None)
+        # An already-open session can still hold a result from before Greek sweeps were added.
+        curve = initial_result.get("greek_curve")
+        if curve is not None and curve["axis"] == "spot" and (curve["values"][0], curve["values"][-1]) == ranges["spot"]:
+            st.session_state.bsm_explorer_result = initial_result
+            st.session_state.bsm_explorer_request = (
+                *[baseline[name] for name in BSM_AXES], baseline["option"], "spot", *ranges["spot"],
+            )
+
+    st.subheader("Live Greek explorer")
+    st.caption(
+        "Sliders update BSM automatically when released; no Run button is needed. "
+        "Monte Carlo, Binomial and PPN stay unchanged. Run pricers reloads the shared inputs and resets the sweep to spot."
+    )
+    left, right = st.columns(2)
+    with left:
+        option = st.selectbox("BSM option", ["Call", "Put"], key="bsm_option").lower()
+    with right:
+        axis = st.selectbox("Chart x-axis", list(BSM_AXES), format_func=lambda name: BSM_AXES[name][0], key="bsm_axis")
+    values = {}
+    for index, (name, (label, scale)) in enumerate(BSM_AXES.items()):
+        low, high = (value * scale for value in ranges[name])
+        with (left if index % 2 == 0 else right):
+            values[name] = st.slider(
+                label, float(low), float(high), step=float((high - low) / 200),
+                format="%.4f", key=f"bsm_{name}",
+            ) / scale
+    st.caption("Slider ranges stay fixed while exploring. To explore a different scale, set the sidebar inputs and Run pricers.")
+    request = (*[values[name] for name in BSM_AXES], option, axis, *ranges[axis])
+    if request != st.session_state.get("bsm_explorer_request"):
+        st.session_state.bsm_explorer_request = request
+        st.session_state.pop("bsm_explorer_result", None)
+        st.session_state.pop("bsm_explorer_error", None)
+        try:
+            st.session_state.bsm_explorer_result = run_engine(PRICING_ENGINE, [
+                "bsm", values["spot"], values["strike"], values["maturity"], values["rate"],
+                values["volatility"], option, axis, *ranges[axis],
+            ])
+        except RuntimeError as error:
+            st.session_state.bsm_explorer_error = str(error)
+    if "bsm_explorer_error" in st.session_state:
+        st.error(st.session_state.bsm_explorer_error)
+        st.caption("After resolving the error, move a slider or click Run pricers to retry.")
+        return
+    result = st.session_state.bsm_explorer_result
+    inputs = result["inputs"]
+    st.caption(
+        f"Live BSM: {inputs['option']} | S={inputs['spot']:g}, K={inputs['strike']:g}, "
+        f"T={inputs['maturity']:g} years, r={inputs['rate']:.2%}, volatility={inputs['volatility']:.2%}"
+    )
+    render_bsm_result(result)
+    st.download_button(
+        "Download live BSM (JSON)", json.dumps(result, indent=2, allow_nan=False),
+        file_name="bsm_run.json", mime="application/json", key="download_bsm",
     )
 
 
@@ -204,10 +353,10 @@ def render_binomial(result):
 
 st.set_page_config(page_title="Option pricing playground", layout="wide")
 st.title("Option pricing playground")
-st.caption("Shared contract inputs | Constant interest and volatility | No dividends | All pricing in C++")
+st.caption("First three tabs: constant interest/volatility, no dividends. Portfolio Strats: historical inputs and explicit funding assumptions.")
 
 with st.sidebar.form("inputs"):
-    st.subheader("Shared inputs")
+    st.subheader("Inputs for the first three tabs")
     option = st.selectbox("Option", ["Call", "Put"], key="option")
     spot = st.number_input("Spot", 0.01, 1e9, 100.0, key="spot")
     strike = st.number_input("Strike", 0.0, 1e9, 100.0, key="strike")
@@ -225,37 +374,33 @@ with st.sidebar.form("inputs"):
     st.subheader("Binomial only")
     steps = st.number_input("Tree steps", 1, 1000, 100, step=1, key="steps")
     exercise = st.selectbox("Tree exercise", ["European", "American"], key="exercise")
-    submitted = st.form_submit_button("Run pricers", type="primary")
+    submitted = st.form_submit_button("Run pricers", key="run_pricers", type="primary")
 
 if submitted or "results" not in st.session_state:
     common = [spot, strike, maturity, rate / 100, volatility / 100]
+    bsm_inputs = dict(zip(BSM_AXES, common))
+    bounds = bsm_slider_ranges(bsm_inputs)["spot"]
     jobs = {
         "mc": (MC_ENGINE, [*common, simulations, seed, option.lower()]),
-        "bsm": (PRICING_ENGINE, ["bsm", *common, option.lower()]),
+        "bsm": (PRICING_ENGINE, ["bsm", *common, option.lower(), "spot", *bounds]),
         "binomial": (PRICING_ENGINE, ["binomial", *common, option.lower(), steps, exercise.lower()]),
     }
     results, errors = {}, {}
     with st.spinner("Running C++ pricers..."):
         for method, (engine, args) in jobs.items():
             try:
-                process = subprocess.run(
-                    [str(engine), *map(str, args)], capture_output=True, text=True, check=True, timeout=30
-                )
-                results[method] = json.loads(process.stdout)
-            except FileNotFoundError:
-                errors[method] = "C++ engine not found. Start this app with .\\run_gui.ps1 to build it."
-            except subprocess.CalledProcessError as error:
-                errors[method] = error.stderr.strip() or f"C++ engine exited with code {error.returncode}."
-            except subprocess.TimeoutExpired:
-                errors[method] = "C++ calculation exceeded 30 seconds. Reduce simulations or tree steps."
-            except json.JSONDecodeError as error:
-                errors[method] = f"C++ engine returned invalid JSON: {error}"
+                results[method] = run_engine(engine, args)
+            except RuntimeError as error:
+                errors[method] = str(error)
     st.session_state.results = results
     st.session_state.errors = errors
+    for key in ("bsm_baseline", "bsm_explorer_request", "bsm_explorer_result", "bsm_explorer_error"):
+        st.session_state.pop(key, None)
 
-st.caption("Change inputs and click Run pricers to update all tabs. Switching tabs does not resample Monte Carlo.")
+st.caption("Run pricers updates the first three tabs. BSM also has live sliders; Portfolio Strats has separate controls. Switching tabs does not resample Monte Carlo.")
+tabs = st.tabs(["Monte Carlo", "BSM", "Binomial", "Portfolio Strats"])
 for tab, method, render in zip(
-    st.tabs(["Monte Carlo", "BSM", "Binomial"]),
+    tabs[:3],
     ["mc", "bsm", "binomial"],
     [render_mc, render_bsm, render_binomial],
 ):
@@ -264,6 +409,9 @@ for tab, method, render in zip(
             st.error(st.session_state.errors[method])
             continue
         result = st.session_state.results[method]
+        if method == "bsm":
+            render(result)
+            continue
         inputs = result["inputs"]
         st.caption(
             f"Displayed run: {inputs['option']} | S={inputs['spot']:g}, K={inputs['strike']:g}, "
@@ -275,3 +423,6 @@ for tab, method, render in zip(
             file_name="monte_carlo_run.json" if method == "mc" else f"{method}_run.json",
             mime="application/json", key=f"download_{method}",
         )
+
+with tabs[3]:
+    render_portfolio()

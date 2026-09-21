@@ -2,3 +2,4 @@
 .gui-build/
 __pycache__/
 out/
+.market-data/

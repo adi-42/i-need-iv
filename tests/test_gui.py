@@ -1,3 +1,4 @@
+import copy
 import json
 import math
 from pathlib import Path
@@ -25,6 +26,8 @@ def analytic(method="bsm", **changes):
     args = [method, *[str(changes.get(name, default)) for name, default in zip(names, defaults)]]
     if method == "binomial":
         args += [str(changes.get("steps", 100)), changes.get("exercise", "european")]
+    elif "axis" in changes:
+        args += [changes["axis"], str(changes["minimum"]), str(changes["maximum"])]
     result = subprocess.run([str(PRICING_ENGINE), *args], capture_output=True, text=True, check=True, timeout=20)
     return json.loads(result.stdout)
 
@@ -162,6 +165,50 @@ class AnalyticEngineTests(unittest.TestCase):
             self.assertEqual(vols["volatility"][0], 0)
             self.assertTrue(all(b >= a - 1e-10 for a, b in zip(vols["price"], vols["price"][1:])))
 
+    def test_greek_sweeps_match_point_pricing_on_every_axis(self):
+        bounds = {"spot": (50, 150), "strike": (0, 200), "maturity": (0, 2),
+                  "rate": (-0.1, 0.2), "volatility": (0, 0.6)}
+        for option in ["call", "put"]:
+            for axis, (low, high) in bounds.items():
+                with self.subTest(option=option, axis=axis):
+                    result = analytic(option=option, axis=axis, minimum=low, maximum=high)
+                    curve = result["greek_curve"]
+                    self.assertEqual(curve["axis"], axis)
+                    self.assertEqual(curve["values"], sorted(set(curve["values"])))
+                    self.assertEqual(curve["values"][0], low)
+                    self.assertEqual(curve["values"][-1], high)
+                    self.assertGreaterEqual(len(curve["values"]), 121)
+                    self.assertLessEqual(len(curve["values"]), 123)
+                    selected = curve["values"].index(result["inputs"][axis])
+                    for name in ["delta", "gamma", "theta", "vega", "rho"]:
+                        self.assertEqual(len(curve[name]), len(curve["values"]))
+                        self.assertEqual(curve[name][selected], result["greeks"][name])
+                    for index in [0, 37, len(curve["values"]) - 1]:
+                        point = analytic(option=option, **{axis: curve["values"][index]})
+                        for name in ["delta", "gamma", "theta", "vega", "rho"]:
+                            if point["greeks"] is None:
+                                self.assertIsNone(curve[name][index])
+                            else:
+                                self.assertAlmostEqual(curve[name][index], point["greeks"][name], places=12)
+
+    def test_greek_sweep_boundaries_are_gaps_not_zeroes(self):
+        for changes in [dict(maturity=0), dict(volatility=0), dict(strike=0)]:
+            curve = analytic(**changes)["greek_curve"]
+            for name in ["delta", "gamma", "theta", "vega", "rho"]:
+                self.assertTrue(all(value is None for value in curve[name]))
+        result = analytic(maturity=0, axis="maturity", minimum=0, maximum=2)
+        self.assertIsNone(result["greeks"])
+        self.assertIsNone(result["greek_curve"]["gamma"][0])
+        self.assertGreater(result["greek_curve"]["gamma"][1], 0)
+
+    def test_moving_selected_spot_preserves_curve_at_common_points(self):
+        first = analytic(axis="spot", minimum=50, maximum=150)["greek_curve"]
+        second = analytic(spot=117.2, axis="spot", minimum=50, maximum=150)["greek_curve"]
+        for name in ["delta", "gamma", "theta", "vega", "rho"]:
+            lookup = dict(zip(second["values"], second[name]))
+            for spot, value in zip(first["values"], first[name]):
+                self.assertEqual(value, lookup[spot])
+
     def test_boundary_prices_and_greek_availability(self):
         for changes in [dict(maturity=0, spot=80), dict(volatility=0, spot=80), dict(strike=0)]:
             for option in ["call", "put"]:
@@ -252,6 +299,13 @@ class AnalyticEngineTests(unittest.TestCase):
             args[index] = value
             cases.append(args)
         cases += [[], defaults + ["10", "european"], ["binomial", *defaults[1:]]]
+        for sweep in [
+            ["other", "50", "150"], ["spot", "150", "50"], ["spot", "50", "50"],
+            ["spot", "101", "150"], ["spot", "0", "150"], ["rate", "-0.6", "0.2"],
+            ["volatility", "0", "3.1"], ["maturity", "0", "31"], ["strike", "-1", "200"],
+            ["spot", "nan", "150"], ["spot"], ["spot", "50"],
+        ]:
+            cases.append([*defaults, *sweep])
         for steps, exercise in [("0", "european"), ("1001", "european"), ("1.5", "american"),
                                 ("-1", "european"), ("100", "other")]:
             cases.append(["binomial", *defaults[1:], steps, exercise])
@@ -274,16 +328,16 @@ class GuiTests(unittest.TestCase):
         app = self.app()
         self.assertFalse(app.exception)
         self.assertFalse(app.error)
-        self.assertEqual([tab.label for tab in app.tabs], ["Monte Carlo", "BSM", "Binomial"])
+        self.assertEqual([tab.label for tab in app.tabs], ["Monte Carlo", "BSM", "Binomial", "Portfolio Strats"])
         self.assertEqual(len(app.metric), 11)
-        self.assertEqual(len(app.get("plotly_chart")), 7)
+        self.assertEqual(len(app.get("plotly_chart")), 12)
         app.selectbox(key="option").select("Put")
         app.number_input(key="seed").set_value(17)
         app.number_input(key="rate").set_value(-2.0)
         app.select_slider(key="simulations").set_value(1000)
         app.number_input(key="steps").set_value(101)
         app.selectbox(key="exercise").select("American")
-        app.button[0].click().run()
+        app.button(key="run_pricers").click().run()
         self.assertFalse(app.exception)
         self.assertFalse(app.error)
         results = app.session_state["results"]
@@ -308,7 +362,7 @@ class GuiTests(unittest.TestCase):
         run.assert_not_called()
         self.assertFalse(app.exception)
         app.number_input(key="seed").set_value(43)
-        app.button[0].click().run()
+        app.button(key="run_pricers").click().run()
         after = app.session_state["results"]
         self.assertNotEqual(before["mc"]["price"], after["mc"]["price"])
         self.assertEqual(before["bsm"], after["bsm"])
@@ -322,7 +376,7 @@ class GuiTests(unittest.TestCase):
             self.assertAlmostEqual(float(table.iloc[row]["Value"]), greeks[greek] / scale, places=6)
         app.number_input(key="maturity").set_value(0.0)
         app.number_input(key="spot").set_value(120.0)
-        app.button[0].click().run()
+        app.button(key="run_pricers").click().run()
         self.assertFalse(app.exception)
         self.assertFalse(app.error)
         self.assertEqual(len(app.table), 0)
@@ -333,7 +387,7 @@ class GuiTests(unittest.TestCase):
         app = self.app()
         app.number_input(key="strike").set_value(1000.0)
         app.select_slider(key="simulations").set_value(100)
-        app.button[0].click().run()
+        app.button(key="run_pricers").click().run()
         self.assertFalse(app.exception)
         self.assertTrue(app.warning)
         self.assertIn("Few nonzero", app.warning[0].value)
@@ -342,7 +396,7 @@ class GuiTests(unittest.TestCase):
         app = self.app()
         failure = subprocess.CalledProcessError(1, [str(ENGINE)], stderr="Intentional engine failure")
         with patch("subprocess.run", side_effect=failure):
-            app.button[0].click().run()
+            app.button(key="run_pricers").click().run()
         self.assertFalse(app.exception)
         self.assertIn("Intentional engine failure", app.error[0].value)
         self.assertEqual(len(app.metric), 0)
@@ -358,14 +412,14 @@ class GuiTests(unittest.TestCase):
             return run(command, **kwargs)
 
         with patch("subprocess.run", side_effect=fail_mc):
-            app.button[0].click().run()
+            app.button(key="run_pricers").click().run()
         self.assertFalse(app.exception)
         self.assertEqual(len(app.error), 1)
         self.assertEqual(app.error[0].value, "MC failed")
         self.assertNotIn("mc", app.session_state["results"])
         self.assertEqual(len(app.metric), 7)
-        self.assertEqual(len(app.get("plotly_chart")), 4)
-        app.button[0].click().run()
+        self.assertEqual(len(app.get("plotly_chart")), 9)
+        app.button(key="run_pricers").click().run()
         self.assertFalse(app.error)
         self.assertEqual(len(app.session_state["results"]), 3)
 
@@ -379,11 +433,162 @@ class GuiTests(unittest.TestCase):
                 app = self.app()
                 kwargs = {"side_effect": failure} if isinstance(failure, Exception) else {"return_value": failure}
                 with patch("subprocess.run", **kwargs):
-                    app.button[0].click().run()
+                    app.button(key="run_pricers").click().run()
                 self.assertFalse(app.exception)
                 self.assertEqual(len(app.error), 3)
                 self.assertTrue(all(expected in error.value for error in app.error))
                 self.assertEqual(len(app.metric), 0)
+
+
+class GreekExplorerTests(unittest.TestCase):
+    def setUp(self):
+        from streamlit.testing.v1 import AppTest
+        self.app = AppTest.from_file(str(ROOT / "gui.py"), default_timeout=25).run()
+        self.assertFalse(self.app.exception)
+        self.assertFalse(self.app.error)
+
+    def greek_charts(self):
+        return {
+            name: json.loads(next(chart.proto.spec for chart in self.app.get("plotly_chart")
+                                  if chart.proto.id.endswith(f"-bsm_greek_{name}")))
+            for name in ["delta", "gamma", "theta", "vega", "rho"]
+        }
+
+    def test_each_slider_updates_bsm_only_without_submission(self):
+        app = self.app
+        prior = copy.deepcopy(app.session_state["results"])
+        for name, displayed, native in [
+            ("spot", 110.0, 110.0), ("strike", 105.0, 105.0), ("maturity", 0.5, 0.5),
+            ("rate", -2.0, -0.02), ("volatility", 35.0, 0.35),
+        ]:
+            with self.subTest(name=name), patch("subprocess.run", wraps=subprocess.run) as run:
+                app.slider(key=f"bsm_{name}").set_value(displayed).run()
+                self.assertFalse(app.exception)
+                self.assertFalse(app.error)
+                run.assert_called_once()
+                self.assertEqual(run.call_args.args[0][:2], [str(PRICING_ENGINE), "bsm"])
+                self.assertEqual(app.session_state["bsm_explorer_result"]["inputs"][name], native)
+                self.assertEqual(app.session_state["results"], prior)
+        with patch("subprocess.run", wraps=subprocess.run) as run:
+            app.selectbox(key="bsm_option").select("Put").run()
+        run.assert_called_once()
+        result = app.session_state["bsm_explorer_result"]
+        self.assertLess(result["greeks"]["delta"], 0)
+        self.assertEqual(result["inputs"]["option"], "put")
+        self.assertEqual(app.session_state["results"], prior)
+
+    def test_axes_markers_and_display_units(self):
+        app = self.app
+        for axis, scale in [("spot", 1), ("strike", 1), ("maturity", 1), ("rate", 100), ("volatility", 100)]:
+            with self.subTest(axis=axis):
+                app.selectbox(key="bsm_axis").select(axis).run()
+                self.assertFalse(app.exception)
+                self.assertFalse(app.error)
+                result = app.session_state["bsm_explorer_result"]
+                self.assertEqual(result["greek_curve"]["axis"], axis)
+                charts = self.greek_charts()
+                self.assertEqual(len(charts), 5)
+                for name, divisor in [("delta", 1), ("gamma", 1), ("theta", 365), ("vega", 100), ("rho", 100)]:
+                    curve, marker = charts[name]["data"]
+                    self.assertFalse(curve["connectgaps"])
+                    self.assertEqual(marker["x"], [result["inputs"][axis] * scale])
+                    self.assertEqual(marker["y"], [result["greeks"][name] / divisor])
+                    self.assertEqual(curve["x"], [value * scale for value in result["greek_curve"]["values"]])
+                    self.assertEqual(curve["y"], [
+                        None if value is None else value / divisor for value in result["greek_curve"][name]
+                    ])
+                table = app.table[0].value
+                self.assertAlmostEqual(float(table.iloc[2]["Value"]), result["greeks"]["theta"] / 365, places=6)
+
+    def test_fixed_ranges_cache_and_shared_input_reset(self):
+        app = self.app
+        low, high = app.slider(key="bsm_spot").min, app.slider(key="bsm_spot").max
+        app.slider(key="bsm_spot").set_value(120.0).run()
+        self.assertEqual((app.slider(key="bsm_spot").min, app.slider(key="bsm_spot").max), (low, high))
+        before = copy.deepcopy(app.session_state["bsm_explorer_result"])
+        with patch("subprocess.run") as run:
+            app.run()
+        run.assert_not_called()
+        self.assertFalse(app.exception)
+        self.assertEqual(app.session_state["bsm_explorer_result"], before)
+        app.selectbox(key="bsm_axis").select("volatility").run()
+        app.number_input(key="spot").set_value(250.0)
+        app.selectbox(key="option").select("Put")
+        app.button(key="run_pricers").click().run()
+        self.assertFalse(app.exception)
+        self.assertFalse(app.error)
+        self.assertEqual(app.slider(key="bsm_spot").value, 250)
+        self.assertEqual(app.selectbox(key="bsm_option").value, "Put")
+        self.assertEqual(app.selectbox(key="bsm_axis").value, "spot")
+        self.assertEqual(app.session_state["bsm_explorer_result"], app.session_state["results"]["bsm"])
+
+    def test_existing_session_without_curves_refreshes_only_bsm(self):
+        app = self.app
+        app.session_state["results"]["bsm"].pop("greek_curve")
+        prior = copy.deepcopy(app.session_state["results"])
+        del app.session_state["bsm_baseline"]
+        with patch("subprocess.run", wraps=subprocess.run) as run:
+            app.run()
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0][:2], [str(PRICING_ENGINE), "bsm"])
+        self.assertFalse(app.exception)
+        self.assertFalse(app.error)
+        self.assertEqual(len(self.greek_charts()), 5)
+        self.assertEqual(app.session_state["results"], prior)
+
+    def test_export_contains_live_inputs_and_curves(self):
+        import streamlit as st
+        app = self.app
+        app.slider(key="bsm_rate").set_value(-2.0).run()
+        app.selectbox(key="bsm_axis").select("rate").run()
+        with patch("streamlit.download_button", wraps=st.download_button) as download:
+            app.run()
+        self.assertFalse(app.exception)
+        exported = next(call.args[1] for call in download.call_args_list if call.kwargs.get("key") == "download_bsm")
+        result = json.loads(exported)
+        self.assertEqual(result, app.session_state["bsm_explorer_result"])
+        self.assertEqual(result["inputs"]["rate"], -0.02)
+        self.assertEqual(result["greek_curve"]["axis"], "rate")
+
+    def test_live_boundaries_do_not_plot_fake_zero_greeks(self):
+        app = self.app
+        app.selectbox(key="bsm_axis").select("maturity").run()
+        app.slider(key="bsm_maturity").set_value(0.0).run()
+        self.assertFalse(app.exception)
+        self.assertIsNone(app.session_state["bsm_explorer_result"]["greeks"])
+        self.assertEqual(len(app.table), 0)
+        for chart in self.greek_charts().values():
+            self.assertEqual(len(chart["data"]), 1)
+            self.assertIsNone(chart["data"][0]["y"][0])
+        app.selectbox(key="bsm_axis").select("spot").run()
+        for chart in self.greek_charts().values():
+            self.assertTrue(all(value is None for value in chart["data"][0]["y"]))
+        app.slider(key="bsm_maturity").set_value(0.5).run()
+        self.assertFalse(app.exception)
+        self.assertEqual(len(app.table), 1)
+
+    def test_live_failure_clears_stale_charts_and_recovers(self):
+        app = self.app
+        prior = copy.deepcopy(app.session_state["results"])
+        for i, failure in enumerate([
+            FileNotFoundError(), subprocess.TimeoutExpired("engine", 30),
+            subprocess.CalledProcessError(1, "engine", stderr="Intentional BSM failure"),
+            subprocess.CompletedProcess("engine", 0, stdout="{broken"),
+            subprocess.CompletedProcess("engine", 0, stdout="{}"),
+        ]):
+            with self.subTest(failure=failure):
+                kwargs = {"side_effect": failure} if isinstance(failure, Exception) else {"return_value": failure}
+                with patch("subprocess.run", **kwargs):
+                    app.slider(key="bsm_volatility").set_value(30.0 + i).run()
+                self.assertFalse(app.exception)
+                self.assertEqual(len(app.error), 1)
+                self.assertNotIn("bsm_explorer_result", app.session_state)
+                self.assertEqual(len(app.get("plotly_chart")), 5)
+                self.assertEqual(app.session_state["results"], prior)
+                app.slider(key="bsm_volatility").set_value(20.0).run()
+                self.assertFalse(app.exception)
+                self.assertFalse(app.error)
+                self.assertEqual(len(self.greek_charts()), 5)
 
 
 if __name__ == "__main__":
